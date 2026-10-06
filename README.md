@@ -4,6 +4,10 @@
 体数据做三线性插值采样。严格校验方向矩阵（sform/qform）、字节序与强度
 缩放，避免核对到错误体素。纯 Python 标准库实现，无第三方依赖。
 
+`/api/nifti/compare` 在**同一 RAS 世界坐标**下逐点对比基线与随访两份
+扫描：两侧网格尺寸、方向、缩放无需相同，每个坐标独立映射到各自的体素
+空间，便于区分真实强度变化与单侧不可采样。
+
 ## API
 
 ### `POST /api/nifti/sample`
@@ -51,9 +55,10 @@ curl -F "file=@vol.nii" \
 | code | status | field | 含义 |
 | --- | --- | --- | --- |
 | `invalid_multipart` | 400/415 | — | 表单结构非法 |
-| `missing_file` / `multiple_files` | 400 | `file` | 文件部分缺失/多于一个 |
+| `missing_file` / `multiple_files` | 400 | `file`/`baseline`/`followup` | 文件部分缺失/多于一个（compare 的 `field` 标明侧别） |
+| `unexpected_file` | 400 | 多出的字段名 | compare 仅接受 `baseline`/`followup` 两个文件部分 |
 | `missing_points` / `invalid_points` | 400 | `points` | 坐标字段缺失、数量越界、id 重复/非法、坐标非有限（message 含点号） |
-| `file_too_large` | 413 | `file` | 超过 16 MiB |
+| `file_too_large` | 413 | `file`/`baseline`/`followup` | 单文件超过 16 MiB（compare 错误体另含 `file` 侧别） |
 | `header_too_short` | 400 | `file` | 不足 348 字节头部 |
 | `bad_sizeof_hdr` | 400 | `sizeof_hdr` | 两种字节序下都不是 348 |
 | `unsupported_magic` | 400 | `magic` | 非 `n+1`（如 `.hdr/.img` 对的 `ni1`） |
@@ -71,6 +76,63 @@ curl -F "file=@vol.nii" \
 
 逐点错误（200 响应内）：`out_of_bounds`（逆变换后落在体素中心闭域
 `[0, n-1]` 之外）、`non_finite_data`（插值邻域内缩放后数据非有限）。
+
+### `POST /api/nifti/compare`
+
+`multipart/form-data`，包含：
+
+| 部分 | 说明 |
+| --- | --- |
+| `baseline` 文件部分（字段名固定，须带 `filename`） | 基线 NIfTI-1 `.nii` 文件，≤ 16 MiB |
+| `followup` 文件部分（字段名固定，须带 `filename`） | 随访 NIfTI-1 `.nii` 文件，≤ 16 MiB |
+| `points` 字段 | 与 sample 完全相同：JSON 数组，1–256 个 `{"id", "point"}` |
+
+两份文件**分别**沿用同一套 NIfTI 校验、仿射选择（sform 优先于 qform）
+与三线性插值规则；尺寸、字节序、数据类型、仿射来源均可不同。每个世界
+坐标独立经两侧仿射的逆变换映射到各自连续体素坐标——不存在两侧网格对齐
+或直接相减。
+
+```bash
+curl -F "baseline=@base.nii" -F "followup=@fu.nii" \
+     -F 'points=[{"id": 1, "point": [12.0, 26.0, 42.0]}]' \
+     http://localhost:8000/api/nifti/compare
+```
+
+**成功响应（200）**，结果顺序与请求一致：
+
+```json
+{
+  "transform": {"baseline": "sform", "followup": "qform"},
+  "results": [
+    {"id": 1, "status": "ok",
+     "baseline": {"voxel": [1.0, 2.0, 3.0], "intensity": 647.0,
+                  "transform": "sform"},
+     "followup": {"voxel": [0.8, 2.1, 2.9], "intensity": 655.0,
+                  "transform": "qform"},
+     "difference": 8.0},
+    {"id": 2, "status": "error",
+     "errors": {
+       "followup": {"code": "out_of_bounds", "message": "...",
+                    "voxel": [-2.0, 0.0, 0.0]}}}
+  ]
+}
+```
+
+成功点给出每侧的连续体素坐标（`voxel`）、缩放后插值强度
+（`intensity`）、变换来源（`transform`），以及
+`difference = followup.intensity - baseline.intensity`。
+
+**逐点错误按侧隔离**：任一侧越界或邻域内数据非有限时，该点标记为
+`"status": "error"`，并在 `errors` 中只列出失败侧（键为 `baseline`
+和/或 `followup`），错误体同样含 `code`、`message`（及越界时的
+`voxel`）。一侧失败不影响其他点，也不影响另一侧的采样判定。
+
+文件级错误的 JSON 在原有 `code`/`message`/`field` 之外增加
+`"file": "baseline" | "followup"`，将失败定位到具体上传及具体头字段
+（如 `{"code": "singular_affine", "field": "srow", "file": "followup"}`）。
+表单缺侧返回 `missing_file`（`field` 为缺失侧），出现第三个文件部分
+返回 `unexpected_file`，单侧超 16 MiB 返回带 `file` 侧别的
+`file_too_large`。
 
 ### `GET /healthz`
 
@@ -117,7 +179,7 @@ docker compose up --build --exit-code-from verify verify
 | --- | --- | --- |
 | bit0 | 1 | 代码测试（`tests/` 单元 + 集成测试） |
 | bit1 | 2 | 镜像构建校验（构建清单、运行时版本、模块导入、采样自检） |
-| bit2 | 4 | API 冒烟（大/小端 × sform/qform × int16/float32 样本矩阵 + 结构错误与逐点错误用例） |
+| bit2 | 4 | API 冒烟（大/小端 × sform/qform × int16/float32 样本矩阵；compare 两侧端序/数据类型/仿射字段/网格交叉矩阵 + 单侧越界、单侧非有限与侧别文件错误用例；及结构错误与逐点错误用例） |
 
 退出码 0 表示全部通过。本地复现（stage 2 需要镜像构建清单
 `image-manifest.json`，仅在 Dockerfile 构建时生成）：

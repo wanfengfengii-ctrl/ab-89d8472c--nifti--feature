@@ -1,7 +1,11 @@
-"""HTTP server exposing ``POST /api/nifti/sample`` (pure stdlib).
+"""HTTP server exposing ``POST /api/nifti/sample`` and
+``POST /api/nifti/compare`` (pure stdlib).
 
-The multipart form carries exactly one NIfTI-1 .nii file (<= 16 MiB) and a
-``points`` JSON field with 1..256 uniquely-numbered finite 3D coordinates.
+The multipart form of ``sample`` carries exactly one NIfTI-1 .nii file
+(<= 16 MiB) and a ``points`` JSON field with 1..256 uniquely-numbered
+finite 3D coordinates.  ``compare`` carries two files (``baseline`` and
+``followup``, each <= 16 MiB) plus the same ``points`` field; every world
+coordinate is mapped independently into each volume's voxel grid.
 See README.md for the full API contract.
 """
 from __future__ import annotations
@@ -21,9 +25,14 @@ log = logging.getLogger("nifti_sampler")
 
 MAX_FILE_BYTES = 16 * 1024 * 1024                # 16 MiB single-file limit
 MAX_BODY_BYTES = MAX_FILE_BYTES + 1024 * 1024    # file + multipart overhead
+MAX_COMPARE_BODY_BYTES = 2 * MAX_FILE_BYTES + 1024 * 1024
 MAX_POINTS = 256
 SAMPLE_PATH = "/api/nifti/sample"
+COMPARE_PATH = "/api/nifti/compare"
 HEALTH_PATH = "/healthz"
+
+# Multipart form field names of the two compare uploads.
+COMPARE_SIDES = ("baseline", "followup")
 
 
 # ---------------------------------------------------------------------------
@@ -166,16 +175,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_expect_100(self):
         # Reject oversized uploads before the client streams the body.
+        path = self.path.split("?", 1)[0]
+        limit = MAX_COMPARE_BODY_BYTES if path == COMPARE_PATH else MAX_BODY_BYTES
         length = self.headers.get("Content-Length")
         try:
             n = int(length) if length is not None else 0
         except ValueError:
             n = 0
-        if n > MAX_BODY_BYTES:
+        if n > limit:
             self._send_json(413, {"error": {
                 "code": "file_too_large",
                 "message": f"request body of {n} bytes exceeds the "
-                           f"{MAX_FILE_BYTES}-byte (16 MiB) file limit",
+                           f"{MAX_FILE_BYTES}-byte (16 MiB) per-file limit",
                 "field": "file",
             }}, close=True)
             return False
@@ -189,23 +200,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"status": "ok", "ready": True})
             else:
                 self._send_json(503, {"status": "unavailable", "ready": False})
-        elif path == SAMPLE_PATH:
+        elif path in (SAMPLE_PATH, COMPARE_PATH):
             self._method_not_allowed()
         else:
             self._send_json(404, {"error": {"code": "not_found",
                                             "message": "unknown route"}})
 
     def do_POST(self):
-        if self.path.split("?", 1)[0] != SAMPLE_PATH:
+        path = self.path.split("?", 1)[0]
+        if path == SAMPLE_PATH:
+            handler = self._handle_sample
+        elif path == COMPARE_PATH:
+            handler = self._handle_compare
+        else:
             self._send_json(404, {"error": {"code": "not_found",
                                             "message": "unknown route"}}, close=True)
             return
         try:
-            self._handle_sample()
+            handler()
         except ApiError as err:
             self._send_json(err.status, err.to_dict(), close=True)
         except Exception:  # pragma: no cover - defensive
-            log.exception("unhandled error while sampling")
+            log.exception("unhandled error while handling %s", path)
             self._send_json(500, {"error": {"code": "internal_error",
                                             "message": "unexpected server error"}},
                             close=True)
@@ -226,8 +242,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(405, {"error": {"code": "method_not_allowed",
                                         "message": "method not allowed"}})
 
-    # -- endpoint -------------------------------------------------------------
-    def _handle_sample(self):
+    # -- endpoint helpers -----------------------------------------------------
+    def _content_type_boundary(self):
         ctype = self.headers.get("Content-Type", "")
         media, _, params = ctype.partition(";")
         if media.strip().lower() != "multipart/form-data":
@@ -240,7 +256,9 @@ class Handler(BaseHTTPRequestHandler):
                 boundary = value.strip().strip('"')
         if not boundary or len(boundary) > 200:
             raise ApiError("invalid_multipart", "missing or invalid multipart boundary")
+        return boundary
 
+    def _read_body(self, limit):
         length = self.headers.get("Content-Length")
         if length is None:
             raise ApiError("missing_content_length",
@@ -250,14 +268,40 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             raise ApiError("invalid_content_length",
                            f"invalid Content-Length {length!r}")
-        if n < 0 or n > MAX_BODY_BYTES:
+        if n < 0 or n > limit:
             raise ApiError("file_too_large",
-                           f"request body of {n} bytes exceeds the "
-                           f"{MAX_FILE_BYTES}-byte (16 MiB) file limit",
+                           f"request body of {n} bytes exceeds the allowed size",
                            field="file", status=413)
         body = self.rfile.read(n)
         if len(body) != n:
             raise ApiError("invalid_multipart", "request body truncated")
+        return body
+
+    @staticmethod
+    def _single_field(parts, name):
+        matches = [p for p in parts if p.name == name and p.filename is None]
+        if not matches:
+            raise ApiError("missing_points",
+                           "multipart form must contain a 'points' JSON field",
+                           field="points")
+        if len(matches) > 1:
+            raise ApiError("invalid_multipart", f"multiple '{name}' fields")
+        return matches[0].content
+
+    @staticmethod
+    def _parse_side(raw, side):
+        """Parse one compare upload, tagging every file-level error with the
+        side (``baseline``/``followup``) so reviewers can tell them apart."""
+        try:
+            return parse_nifti(raw)
+        except ApiError as err:
+            err.file = side
+            raise
+
+    # -- endpoints -------------------------------------------------------------
+    def _handle_sample(self):
+        boundary = self._content_type_boundary()
+        body = self._read_body(MAX_BODY_BYTES)
 
         parts = parse_multipart(body, boundary)
         files = [p for p in parts if p.filename is not None]
@@ -269,13 +313,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError("multiple_files",
                            f"expected a single NIfTI file part, got {len(files)}",
                            field="file")
-        point_parts = [p for p in parts if p.name == "points" and p.filename is None]
-        if not point_parts:
-            raise ApiError("missing_points",
-                           "multipart form must contain a 'points' JSON field",
-                           field="points")
-        if len(point_parts) > 1:
-            raise ApiError("invalid_multipart", "multiple 'points' fields")
+        points_raw = self._single_field(parts, "points")
 
         content = files[0].content
         if len(content) > MAX_FILE_BYTES:
@@ -284,7 +322,7 @@ class Handler(BaseHTTPRequestHandler):
                            f"{MAX_FILE_BYTES} (16 MiB)",
                            field="file", status=413)
 
-        points = parse_points(point_parts[0].content)
+        points = parse_points(points_raw)
         volume = parse_nifti(content)
 
         results = []
@@ -302,6 +340,87 @@ class Handler(BaseHTTPRequestHandler):
                                 "voxel": list(voxel), "intensity": intensity,
                                 "transform": volume.transform})
         self._send_json(200, {"transform": volume.transform, "results": results})
+
+    def _handle_compare(self):
+        boundary = self._content_type_boundary()
+        body = self._read_body(MAX_COMPARE_BODY_BYTES)
+
+        parts = parse_multipart(body, boundary)
+
+        # Named file parts: exactly one upload per side.  Extra file parts
+        # (any field name with a filename) are rejected before anything else.
+        side_parts = {}
+        extra = []
+        for part in parts:
+            if part.filename is None:
+                continue
+            if part.name in COMPARE_SIDES:
+                side_parts.setdefault(part.name, []).append(part)
+            else:
+                extra.append(part)
+        if extra:
+            raise ApiError("unexpected_file",
+                           f"compare accepts exactly the 'baseline' and 'followup' "
+                           f"file parts; got unexpected file part {extra[0].name!r}",
+                           field=extra[0].name)
+        contents = {}
+        for side in COMPARE_SIDES:
+            matches = side_parts.get(side, [])
+            if not matches:
+                raise ApiError("missing_file",
+                               f"multipart form must contain a '{side}' NIfTI file part",
+                               field=side)
+            if len(matches) > 1:
+                raise ApiError("multiple_files",
+                               f"expected a single '{side}' file part, got "
+                               f"{len(matches)}",
+                               field=side)
+            content = matches[0].content
+            if len(content) > MAX_FILE_BYTES:
+                raise ApiError("file_too_large",
+                               f"{side} NIfTI file is {len(content)} bytes; limit is "
+                               f"{MAX_FILE_BYTES} (16 MiB)",
+                               field=side, status=413, file=side)
+            contents[side] = content
+
+        points = parse_points(self._single_field(parts, "points"))
+
+        # Parse independently; a bad header on one side never masks the other.
+        baseline = self._parse_side(contents["baseline"], "baseline")
+        followup = self._parse_side(contents["followup"], "followup")
+
+        results = []
+        for pid, coord in points:
+            samples = {}
+            errors = {}
+            for side, volume in (("baseline", baseline), ("followup", followup)):
+                try:
+                    voxel, intensity = sample_point(volume, coord)
+                except PointError as err:
+                    failure = {"code": err.code, "message": err.message}
+                    if err.voxel is not None:
+                        failure["voxel"] = list(err.voxel)
+                    errors[side] = failure
+                else:
+                    samples[side] = {"voxel": list(voxel), "intensity": intensity,
+                                     "transform": volume.transform}
+            if errors:
+                entry = {"id": pid, "status": "error", "errors": errors}
+                results.append(entry)
+                continue
+            b, f = samples["baseline"], samples["followup"]
+            results.append({
+                "id": pid,
+                "status": "ok",
+                "baseline": b,
+                "followup": f,
+                "difference": f["intensity"] - b["intensity"],
+            })
+        self._send_json(200, {
+            "transform": {"baseline": baseline.transform,
+                          "followup": followup.transform},
+            "results": results,
+        })
 
 
 # ---------------------------------------------------------------------------

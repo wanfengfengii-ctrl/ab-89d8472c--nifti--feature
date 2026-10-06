@@ -5,7 +5,8 @@ Aggregates three stages into the process exit code (bit flags):
 * bit 0 (1): unit/integration tests (``tests/``) failed
 * bit 1 (2): image build validation failed (manifest, runtime, imports)
 * bit 2 (4): API smoke failed (big/little endian x sform/qform x
-  int16/float32 sample matrix plus negative cases)
+  int16/float32 sample matrix, the same cross-product on
+  ``/api/nifti/compare`` with differing grids, plus negative cases)
 
 Exit code 0 means every stage passed.  The smoke stage waits for the API
 service to report readiness on ``/healthz`` before sending traffic.
@@ -25,7 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from verify.httpclient import post_sample  # noqa: E402
+from verify.httpclient import BOUNDARY, post_compare, post_compare_raw, post_sample  # noqa: E402
 from verify.nifti_gen import build_nifti  # noqa: E402
 
 EXIT_TESTS = 1
@@ -113,6 +114,36 @@ QFORM_AFFINE = ((0.0, -3.0, 0.0, 10.0),
 QUATERN_90Z = (0.0, 0.0, math.sqrt(0.5))
 DIMS = (4, 5, 6)
 SLOPE, INTER = 2.0, 5.0
+
+# Followup scans in the compare matrix share the baseline world frame but
+# live on a different grid: i is one voxel shorter (3 vs 4) and j is longer
+# (7 vs 6), yielding side-specific out-of-bounds sample points.
+FOLLOW_DIMS = (3, 7, 8)
+
+
+def follow_data(i, j, k):
+    return 500 + 7 * i - 3 * j + 11 * k
+
+
+def trilinear_at(dims, data_fn, fc):
+    """Reference trilinear interpolation of an integer-grid linear function
+    at continuous voxel coordinate ``fc`` (closed voxel-center domain)."""
+    total = 0.0
+    coords_w = []
+    for ax in range(3):
+        n = dims[ax]
+        v = min(max(fc[ax], 0.0), float(n - 1))
+        i0 = int(math.floor(v))
+        t = v - i0
+        if i0 >= n - 1:
+            coords_w.append(((n - 1, 1.0),))
+        else:
+            coords_w.append(((i0, 1.0 - t), (i0 + 1, t)))
+    for ix, wx in coords_w[0]:
+        for iy, wy in coords_w[1]:
+            for iz, wz in coords_w[2]:
+                total += wx * wy * wz * data_fn(ix, iy, iz)
+    return total
 
 
 def data_fn(i, j, k):
@@ -283,6 +314,216 @@ def stage_smoke(base_url):
               status == 400 and err.get("code") == "invalid_points"
               and err.get("field") == "points",
               f"got {status}: {payload}")
+
+    # -- compare matrix: endianness x datatype x affine x grid ---------------
+    # Both scans describe the SAME world frame, but each pairing mates a
+    # combo with its reversed opposite, so the two sides always differ in
+    # byte order and datatype and encode their affine through DIFFERENT
+    # header fields (one sform, the other qform).  Grids also differ:
+    # baseline DIMS=(4,5,6) vs followup FOLLOW_DIMS=(3,7,8), which yields
+    # side-specific out-of-bounds points despite the shared world frame.
+    f_slope, f_inter = 3.0, -7.0
+
+    def build_followup(f_endian, f_datatype, b_transform):
+        kw = dict(endian=f_endian, datatype=f_datatype, dims=FOLLOW_DIMS,
+                  data_fn=follow_data, slope=f_slope, inter=f_inter,
+                  # qform parameters (used when the followup encodes the
+                  # baseline's sform affine via the qform fields)
+                  quatern=(0.0, 0.0, 0.0), qoffset=(10.0, 20.0, 30.0),
+                  pixdim=(1.0, 2.0, 3.0, 4.0),
+                  # sform rows (used when the followup encodes the
+                  # baseline's qform affine via the srow fields)
+                  srow_x=QFORM_AFFINE[0], srow_y=QFORM_AFFINE[1],
+                  srow_z=QFORM_AFFINE[2])
+        if b_transform == "sform":
+            kw.update(transform="qform")      # quatern 0 + diag(2,3,4)+t
+        else:
+            kw.update(transform="sform")      # srow = QFORM_AFFINE
+        return build_nifti(**kw)
+
+    combos = [(e, t, d) for e in ("<", ">") for t in ("sform", "qform")
+              for d in ("int16", "float32")]
+    # id 3 is outside both grids; id 4 only past the followup i-boundary;
+    # id 5 only past the baseline j-boundary (still on the followup boundary).
+    matrix_voxels = {1: (1.0, 2.0, 3.0), 2: (0.5, 0.5, 0.5),
+                     3: (-1.0, 0.0, 0.0), 4: (3.0, 0.0, 0.0),
+                     5: (0.0, 6.0, 0.0)}
+    for bi, fi_idx in enumerate(reversed(range(len(combos)))):
+        b_endian, b_transform, b_datatype = combos[bi]
+        f_endian, f_transform, f_datatype = combos[fi_idx]
+        b_tag = f"{'LE' if b_endian == '<' else 'BE'}/{b_transform}/{b_datatype}"
+        f_tag = f"{'LE' if f_endian == '<' else 'BE'}/{f_transform}/{f_datatype}"
+        tag = f"compare[{b_tag} vs {f_tag}]"
+        b_affine = SFORM_AFFINE if b_transform == "sform" else QFORM_AFFINE
+        b_raw = build_nifti(
+            endian=b_endian, datatype=b_datatype, dims=DIMS, data_fn=data_fn,
+            transform=b_transform, slope=SLOPE, inter=INTER,
+            srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1], srow_z=SFORM_AFFINE[2],
+            quatern=QUATERN_90Z, qoffset=(10.0, 20.0, 30.0),
+            pixdim=(1.0, 2.0, 3.0, 4.0))
+        f_raw = build_followup(f_endian, f_datatype, b_transform)
+
+        points = [{"id": pid, "point": list(world_of(b_affine, v))}
+                  for pid, v in matrix_voxels.items()]
+        status, payload = post_compare(base_url, b_raw, f_raw, points)
+        if not check(f"{tag}: HTTP 200", status == 200, f"got {status}: {payload}"):
+            continue
+        check(f"{tag}: per-side transforms",
+              payload.get("transform") == {"baseline": b_transform,
+                                           "followup": f_transform},
+              repr(payload.get("transform")))
+        results = payload.get("results")
+        if not check(f"{tag}: result count/order",
+                     isinstance(results, list)
+                     and [r.get("id") for r in results] == [1, 2, 3, 4, 5],
+                     repr(results)):
+            continue
+        by_id = {r["id"]: r for r in results}
+
+        for pid, bv in ((1, (1.0, 2.0, 3.0)), (2, (0.5, 0.5, 0.5))):
+            r = by_id[pid]
+            want_b = trilinear_at(DIMS, data_fn, bv) * SLOPE + INTER
+            want_f = trilinear_at(FOLLOW_DIMS, follow_data, bv) * f_slope + f_inter
+            ok = r.get("status") == "ok"
+            got_b = (r.get("baseline") or {}).get("voxel") or []
+            got_f = (r.get("followup") or {}).get("voxel") or []
+            check(f"{tag}: id {pid} independent voxel mapping",
+                  ok and len(got_b) == 3 and len(got_f) == 3
+                  and all(abs(x - y) <= 1e-3 for x, y in zip(got_b, bv))
+                  and all(abs(x - y) <= 1e-3 for x, y in zip(got_f, bv)),
+                  repr(r))
+            check(f"{tag}: id {pid} per-side scaled intensities",
+                  ok
+                  and abs((r.get("baseline") or {}).get("intensity", 0.0) - want_b)
+                  <= 1e-2
+                  and abs((r.get("followup") or {}).get("intensity", 0.0) - want_f)
+                  <= 1e-2
+                  and abs(r.get("difference", 0.0) - (want_f - want_b)) <= 1e-2,
+                  f"want b={want_b}, f={want_f}; got {r}")
+            check(f"{tag}: id {pid} transform labels",
+                  ok and (r.get("baseline") or {}).get("transform") == b_transform
+                  and (r.get("followup") or {}).get("transform") == f_transform,
+                  repr(r))
+
+        err3 = by_id[3].get("errors", {})
+        check(f"{tag}: id 3 both sides fail together",
+              by_id[3].get("status") == "error" and set(err3) ==
+              {"baseline", "followup"}
+              and all(err3[s].get("code") == "out_of_bounds"
+                      and "voxel" in err3[s] for s in err3),
+              repr(by_id[3]))
+        err4 = by_id[4].get("errors", {})
+        check(f"{tag}: id 4 followup-only failure isolated",
+              by_id[4].get("status") == "error" and set(err4) == {"followup"}
+              and err4.get("followup", {}).get("code") == "out_of_bounds"
+              and "voxel" in err4.get("followup", {}),
+              repr(by_id[4]))
+        err5 = by_id[5].get("errors", {})
+        check(f"{tag}: id 5 baseline-only failure isolated",
+              by_id[5].get("status") == "error" and set(err5) == {"baseline"}
+              and err5.get("baseline", {}).get("code") == "out_of_bounds"
+              and "voxel" in err5.get("baseline", {}),
+              repr(by_id[5]))
+
+    # -- compare: non-finite data on one side only ----------------------------
+    world1 = list(world_of(SFORM_AFFINE, (1.0, 2.0, 3.0)))
+    b_raw = build_nifti(endian="<", datatype="int16", dims=DIMS, data_fn=data_fn,
+                        transform="sform", srow_x=SFORM_AFFINE[0],
+                        srow_y=SFORM_AFFINE[1], srow_z=SFORM_AFFINE[2])
+
+    def nan_follow(i, j, k):
+        return float("nan") if (i, j, k) == (1, 2, 3) else follow_data(i, j, k)
+
+    f_raw = build_nifti(endian=">", datatype="float32", dims=FOLLOW_DIMS,
+                        data_fn=nan_follow, transform="sform",
+                        srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1],
+                        srow_z=SFORM_AFFINE[2])
+    points = [
+        {"id": 1, "point": world1},
+        {"id": 5, "point": list(world_of(SFORM_AFFINE, (0.0, 6.0, 0.0)))},
+    ]
+    status, payload = post_compare(base_url, b_raw, f_raw, points)
+    results = {r.get("id"): r for r in payload.get("results", [])} \
+        if isinstance(payload, dict) else {}
+    e1 = results.get(1, {}).get("errors", {})
+    check("compare: non-finite followup flagged on followup side",
+          status == 200 and set(e1) == {"followup"}
+          and e1.get("followup", {}).get("code") == "non_finite_data",
+          f"got {status}: {payload}")
+    e5 = results.get(5, {}).get("errors", {})
+    check("compare: baseline-only error reported without followup noise",
+          results.get(5, {}).get("status") == "error" and set(e5) == {"baseline"}
+          and e5.get("baseline", {}).get("code") == "out_of_bounds",
+          repr(results.get(5)))
+
+    # -- compare: file-level errors are side-tagged ---------------------------
+    good_b = b_raw
+    good_f = build_nifti(endian=">", datatype="float32", dims=FOLLOW_DIMS,
+                         data_fn=follow_data, transform="sform",
+                         srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1],
+                         srow_z=SFORM_AFFINE[2])
+    one_point = [{"id": 1, "point": world1}]
+    compare_neg = [
+        ("baseline trailing bytes",
+         build_nifti(endian="<", datatype="int16", dims=DIMS, data_fn=data_fn,
+                     transform="sform", srow_x=SFORM_AFFINE[0],
+                     srow_y=SFORM_AFFINE[1], srow_z=SFORM_AFFINE[2],
+                     extra=b"\x00"), good_f,
+         "trailing_bytes", "file", "baseline"),
+        ("followup no affine", good_b,
+         build_nifti(endian=">", datatype="float32", dims=FOLLOW_DIMS,
+                     data_fn=follow_data, transform="sform",
+                     srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1],
+                     srow_z=SFORM_AFFINE[2], qform_code=0, sform_code=0),
+         "missing_affine", "qform_code,sform_code", "followup"),
+        ("BE baseline singular sform",
+         build_nifti(endian=">", datatype="int16", dims=DIMS, data_fn=data_fn,
+                     transform="sform", srow_x=(0.0, 0.0, 0.0, 0.0)),
+         good_f, "singular_affine", "srow", "baseline"),
+    ]
+    for name, raw_b, raw_f, code, field, side in compare_neg:
+        status, payload = post_compare(base_url, raw_b, raw_f, one_point)
+        err = payload.get("error", {}) if isinstance(payload, dict) else {}
+        check(f"negative[compare {name}]: 400/{code}",
+              status == 400 and err.get("code") == code
+              and err.get("field") == field and err.get("file") == side,
+              f"got {status}: {payload}")
+
+    # missing followup part
+    boundary = BOUNDARY.encode("ascii")
+    body = b"\r\n".join([
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="baseline"; filename="b.nii"',
+        b"Content-Type: application/octet-stream", b"", good_b,
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="points"',
+        b"Content-Type: application/json", b"",
+        json.dumps(one_point).encode("utf-8"),
+        b"--" + boundary + b"--", b"",
+    ])
+    status, payload = post_compare_raw(base_url, body)
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    check("negative[compare missing followup]: 400/missing_file",
+          status == 400 and err.get("code") == "missing_file"
+          and err.get("field") == "followup",
+          f"got {status}: {payload}")
+
+    # oversized followup part
+    status, payload = post_compare(base_url, good_b,
+                                   b"\x00" * (16 * 1024 * 1024 + 1), one_point)
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    check("negative[compare followup too large]: 413/file_too_large",
+          status == 413 and err.get("code") == "file_too_large"
+          and err.get("file") == "followup",
+          f"got {status}: {payload}")
+
+    # invalid points on compare
+    status, payload = post_compare(base_url, good_b, good_f, [])
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    check("negative[compare empty points]: 400/invalid_points",
+          status == 400 and err.get("code") == "invalid_points"
+          and err.get("field") == "points",
+          f"got {status}: {payload}")
 
     ok = not failures
     print(f"stage smoke: {'PASS' if ok else 'FAIL'} "

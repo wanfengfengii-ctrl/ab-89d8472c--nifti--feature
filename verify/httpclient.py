@@ -56,6 +56,84 @@ def post_sample(base_url, file_bytes, points, *, timeout=30):
         return status, None
 
 
+def build_compare_multipart(baseline_bytes, followup_bytes, points, *,
+                            points_field="points",
+                            baseline_name="baseline.nii",
+                            followup_name="followup.nii"):
+    """Assemble a multipart/form-data body for ``/api/nifti/compare`` with
+    ``baseline``/``followup`` file parts and one ``points`` field."""
+    if not isinstance(points, (bytes, str)):
+        points = json.dumps(points)
+    if isinstance(points, str):
+        points = points.encode("utf-8")
+    boundary = BOUNDARY.encode("ascii")
+
+    def file_part(field, filename, file_bytes):
+        return [
+            b"--" + boundary,
+            b'Content-Disposition: form-data; name="%s"; filename="%s"'
+            % (field.encode("utf-8"), filename.encode("utf-8")),
+            b"Content-Type: application/octet-stream",
+            b"",
+            file_bytes,
+        ]
+
+    lines = (file_part("baseline", baseline_name, baseline_bytes)
+             + file_part("followup", followup_name, followup_bytes)
+             + [
+                 b"--" + boundary,
+                 b'Content-Disposition: form-data; name="%s"'
+                 % points_field.encode("utf-8"),
+                 b"Content-Type: application/json",
+                 b"",
+                 points,
+                 b"--" + boundary + b"--",
+                 b"",
+             ])
+    return b"\r\n".join(lines)
+
+
+def post_compare(base_url, baseline_bytes, followup_bytes, points, *, timeout=30):
+    """POST /api/nifti/compare; returns ``(status, parsed_json_or_None)``."""
+    url = urlsplit(base_url)
+    conn = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=timeout)
+    try:
+        conn.request(
+            "POST", "/api/nifti/compare",
+            body=build_compare_multipart(baseline_bytes, followup_bytes, points),
+            headers={"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"},
+        )
+        resp = conn.getresponse()
+        raw = resp.read()
+        status = resp.status
+    finally:
+        conn.close()
+    try:
+        return status, json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        return status, None
+
+
+def post_compare_raw(base_url, body, *, timeout=30):
+    """POST an arbitrary multipart body to /api/nifti/compare."""
+    url = urlsplit(base_url)
+    conn = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=timeout)
+    try:
+        conn.request(
+            "POST", "/api/nifti/compare", body=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"},
+        )
+        resp = conn.getresponse()
+        raw = resp.read()
+        status = resp.status
+    finally:
+        conn.close()
+    try:
+        return status, json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        return status, None
+
+
 def get_json(base_url, path, *, timeout=5):
     """GET a JSON document; returns ``(status, parsed_json_or_None)``."""
     url = urlsplit(base_url)
