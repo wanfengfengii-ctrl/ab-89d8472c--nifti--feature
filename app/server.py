@@ -1,7 +1,15 @@
-"""HTTP server exposing ``POST /api/nifti/sample`` (pure stdlib).
+"""HTTP server exposing the NIfTI sampling API (pure stdlib).
 
-The multipart form carries exactly one NIfTI-1 .nii file (<= 16 MiB) and a
-``points`` JSON field with 1..256 uniquely-numbered finite 3D coordinates.
+``POST /api/nifti/sample``: the multipart form carries exactly one
+NIfTI-1 .nii file (<= 16 MiB) and a ``points`` JSON field with 1..256
+uniquely-numbered finite 3D coordinates.
+
+``POST /api/nifti/compare``: the multipart form carries two NIfTI-1 .nii
+files (``baseline`` and ``followup``, each <= 16 MiB) plus the same
+``points`` field; every RAS world coordinate is mapped independently into
+both voxel grids and the followup-minus-baseline intensity delta is
+returned per point.
+
 See README.md for the full API contract.
 """
 from __future__ import annotations
@@ -19,11 +27,24 @@ from .sampling import sample_point
 
 log = logging.getLogger("nifti_sampler")
 
-MAX_FILE_BYTES = 16 * 1024 * 1024                # 16 MiB single-file limit
-MAX_BODY_BYTES = MAX_FILE_BYTES + 1024 * 1024    # file + multipart overhead
+MAX_FILE_BYTES = 16 * 1024 * 1024                     # 16 MiB single-file limit
+MAX_BODY_BYTES = MAX_FILE_BYTES + 1024 * 1024         # file + multipart overhead
+MAX_COMPARE_BODY_BYTES = 2 * MAX_FILE_BYTES + 1024 * 1024  # two files + overhead
 MAX_POINTS = 256
 SAMPLE_PATH = "/api/nifti/sample"
+COMPARE_PATH = "/api/nifti/compare"
 HEALTH_PATH = "/healthz"
+
+_SAMPLE_LIMIT_DESC = f"{MAX_FILE_BYTES}-byte (16 MiB) file limit"
+_COMPARE_LIMIT_DESC = (f"compare limit of {MAX_COMPARE_BODY_BYTES} bytes "
+                       f"(two 16 MiB files plus form overhead)")
+
+
+def _body_budget(path):
+    """``(max_body_bytes, limit_description)`` for the given route path."""
+    if path == COMPARE_PATH:
+        return MAX_COMPARE_BODY_BYTES, _COMPARE_LIMIT_DESC
+    return MAX_BODY_BYTES, _SAMPLE_LIMIT_DESC
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +159,58 @@ def parse_points(raw):
 
 
 # ---------------------------------------------------------------------------
+# compare-endpoint helpers
+# ---------------------------------------------------------------------------
+
+def _named_file_part(parts, name):
+    """Return the single file part named ``name`` (``baseline``/``followup``)."""
+    matches = [p for p in parts if p.name == name and p.filename is not None]
+    if not matches:
+        raise ApiError("missing_file",
+                       f"multipart form must contain a '{name}' NIfTI file part",
+                       field=name, side=name)
+    if len(matches) > 1:
+        raise ApiError("multiple_files",
+                       f"expected a single '{name}' file part, got {len(matches)}",
+                       field=name, side=name)
+    return matches[0]
+
+
+def _points_part(parts):
+    """Return the single non-file ``points`` form field."""
+    point_parts = [p for p in parts if p.name == "points" and p.filename is None]
+    if not point_parts:
+        raise ApiError("missing_points",
+                       "multipart form must contain a 'points' JSON field",
+                       field="points")
+    if len(point_parts) > 1:
+        raise ApiError("invalid_multipart", "multiple 'points' fields")
+    return point_parts[0]
+
+
+def _parse_upload(content, side):
+    """Size-check and parse one compare upload; errors are tagged with ``side``."""
+    if len(content) > MAX_FILE_BYTES:
+        raise ApiError("file_too_large",
+                       f"{side} NIfTI file is {len(content)} bytes; limit is "
+                       f"{MAX_FILE_BYTES} (16 MiB)",
+                       field=side, status=413, side=side)
+    try:
+        return parse_nifti(content)
+    except ApiError as err:
+        err.side = side  # locate the failing upload; err.field names the header field
+        raise
+
+
+def _point_error_entry(pid, err, side):
+    entry = {"id": pid, "status": "error",
+             "error": {"code": err.code, "message": err.message, "side": side}}
+    if err.voxel is not None:
+        entry["error"]["voxel"] = list(err.voxel)
+    return entry
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -171,11 +244,11 @@ class Handler(BaseHTTPRequestHandler):
             n = int(length) if length is not None else 0
         except ValueError:
             n = 0
-        if n > MAX_BODY_BYTES:
+        limit, desc = _body_budget(self.path.split("?", 1)[0])
+        if n > limit:
             self._send_json(413, {"error": {
                 "code": "file_too_large",
-                "message": f"request body of {n} bytes exceeds the "
-                           f"{MAX_FILE_BYTES}-byte (16 MiB) file limit",
+                "message": f"request body of {n} bytes exceeds the {desc}",
                 "field": "file",
             }}, close=True)
             return False
@@ -189,19 +262,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"status": "ok", "ready": True})
             else:
                 self._send_json(503, {"status": "unavailable", "ready": False})
-        elif path == SAMPLE_PATH:
+        elif path in (SAMPLE_PATH, COMPARE_PATH):
             self._method_not_allowed()
         else:
             self._send_json(404, {"error": {"code": "not_found",
                                             "message": "unknown route"}})
 
     def do_POST(self):
-        if self.path.split("?", 1)[0] != SAMPLE_PATH:
+        path = self.path.split("?", 1)[0]
+        if path == SAMPLE_PATH:
+            endpoint = self._handle_sample
+        elif path == COMPARE_PATH:
+            endpoint = self._handle_compare
+        else:
             self._send_json(404, {"error": {"code": "not_found",
                                             "message": "unknown route"}}, close=True)
             return
         try:
-            self._handle_sample()
+            endpoint()
         except ApiError as err:
             self._send_json(err.status, err.to_dict(), close=True)
         except Exception:  # pragma: no cover - defensive
@@ -227,7 +305,8 @@ class Handler(BaseHTTPRequestHandler):
                                         "message": "method not allowed"}})
 
     # -- endpoint -------------------------------------------------------------
-    def _handle_sample(self):
+    def _read_multipart(self, max_body, limit_desc):
+        """Validate headers, read the body and split it into form parts."""
         ctype = self.headers.get("Content-Type", "")
         media, _, params = ctype.partition(";")
         if media.strip().lower() != "multipart/form-data":
@@ -250,16 +329,17 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             raise ApiError("invalid_content_length",
                            f"invalid Content-Length {length!r}")
-        if n < 0 or n > MAX_BODY_BYTES:
+        if n < 0 or n > max_body:
             raise ApiError("file_too_large",
-                           f"request body of {n} bytes exceeds the "
-                           f"{MAX_FILE_BYTES}-byte (16 MiB) file limit",
+                           f"request body of {n} bytes exceeds the {limit_desc}",
                            field="file", status=413)
         body = self.rfile.read(n)
         if len(body) != n:
             raise ApiError("invalid_multipart", "request body truncated")
+        return parse_multipart(body, boundary)
 
-        parts = parse_multipart(body, boundary)
+    def _handle_sample(self):
+        parts = self._read_multipart(MAX_BODY_BYTES, _SAMPLE_LIMIT_DESC)
         files = [p for p in parts if p.filename is not None]
         if not files:
             raise ApiError("missing_file",
@@ -269,13 +349,6 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError("multiple_files",
                            f"expected a single NIfTI file part, got {len(files)}",
                            field="file")
-        point_parts = [p for p in parts if p.name == "points" and p.filename is None]
-        if not point_parts:
-            raise ApiError("missing_points",
-                           "multipart form must contain a 'points' JSON field",
-                           field="points")
-        if len(point_parts) > 1:
-            raise ApiError("invalid_multipart", "multiple 'points' fields")
 
         content = files[0].content
         if len(content) > MAX_FILE_BYTES:
@@ -284,7 +357,7 @@ class Handler(BaseHTTPRequestHandler):
                            f"{MAX_FILE_BYTES} (16 MiB)",
                            field="file", status=413)
 
-        points = parse_points(point_parts[0].content)
+        points = parse_points(_points_part(parts).content)
         volume = parse_nifti(content)
 
         results = []
@@ -302,6 +375,40 @@ class Handler(BaseHTTPRequestHandler):
                                 "voxel": list(voxel), "intensity": intensity,
                                 "transform": volume.transform})
         self._send_json(200, {"transform": volume.transform, "results": results})
+
+    def _handle_compare(self):
+        parts = self._read_multipart(MAX_COMPARE_BODY_BYTES, _COMPARE_LIMIT_DESC)
+        baseline_part = _named_file_part(parts, "baseline")
+        followup_part = _named_file_part(parts, "followup")
+        points = parse_points(_points_part(parts).content)
+        baseline = _parse_upload(baseline_part.content, "baseline")
+        followup = _parse_upload(followup_part.content, "followup")
+
+        results = []
+        for pid, coord in points:
+            try:
+                b_voxel, b_intensity = sample_point(baseline, coord)
+            except PointError as err:
+                results.append(_point_error_entry(pid, err, "baseline"))
+                continue
+            try:
+                f_voxel, f_intensity = sample_point(followup, coord)
+            except PointError as err:
+                results.append(_point_error_entry(pid, err, "followup"))
+                continue
+            results.append({
+                "id": pid, "status": "ok",
+                "baseline": {"voxel": list(b_voxel), "intensity": b_intensity,
+                             "transform": baseline.transform},
+                "followup": {"voxel": list(f_voxel), "intensity": f_intensity,
+                             "transform": followup.transform},
+                "delta": f_intensity - b_intensity,
+            })
+        self._send_json(200, {
+            "baseline": {"transform": baseline.transform},
+            "followup": {"transform": followup.transform},
+            "results": results,
+        })
 
 
 # ---------------------------------------------------------------------------

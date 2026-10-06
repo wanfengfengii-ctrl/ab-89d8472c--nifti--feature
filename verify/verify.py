@@ -5,7 +5,8 @@ Aggregates three stages into the process exit code (bit flags):
 * bit 0 (1): unit/integration tests (``tests/``) failed
 * bit 1 (2): image build validation failed (manifest, runtime, imports)
 * bit 2 (4): API smoke failed (big/little endian x sform/qform x
-  int16/float32 sample matrix plus negative cases)
+  int16/float32 sample matrix plus negative cases, and mixed
+  endianness/datatype/affine/grid compare checks)
 
 Exit code 0 means every stage passed.  The smoke stage waits for the API
 service to report readiness on ``/healthz`` before sending traffic.
@@ -25,7 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from verify.httpclient import post_sample  # noqa: E402
+from verify.httpclient import post_compare, post_sample  # noqa: E402
 from verify.nifti_gen import build_nifti  # noqa: E402
 
 EXIT_TESTS = 1
@@ -283,6 +284,193 @@ def stage_smoke(base_url):
               status == 400 and err.get("code") == "invalid_points"
               and err.get("field") == "points",
               f"got {status}: {payload}")
+
+    # -- compare endpoint: mixed endianness/datatype/affine/grid --------------
+    try:
+        from app.nifti import invert_affine
+    except Exception as exc:  # pragma: no cover - defensive
+        check("compare: app.nifti importable", False, repr(exc))
+        invert_affine = None
+
+    if invert_affine is not None:
+        # Followup grid: different dims/affine from the baseline grid DIMS.
+        # F_SFORM = diag(1,2,5) + t(9,18,25);
+        # F_QFORM = rotz(+90 deg) @ diag(1,2,5) + t(14,20,30).
+        F_DIMS = (6, 5, 4)
+        F_SFORM = ((1.0, 0.0, 0.0, 9.0),
+                   (0.0, 2.0, 0.0, 18.0),
+                   (0.0, 0.0, 5.0, 25.0))
+        F_QFORM = ((0.0, -2.0, 0.0, 14.0),
+                   (1.0, 0.0, 0.0, 20.0),
+                   (0.0, 0.0, 5.0, 30.0))
+        F_SLOPE, F_INTER, F_RAW = 2.0, 1.0, 7.0
+        # constant followup data -> scaled intensity is 15.0 anywhere in-bounds
+        F_INTENSITY = F_RAW * F_SLOPE + F_INTER
+
+        def exp_voxel(affine, world):
+            inv = invert_affine([list(r) for r in affine] + [[0.0, 0.0, 0.0, 1.0]],
+                                field="smoke")
+            x, y, z = world
+            return tuple(inv[r][0] * x + inv[r][1] * y + inv[r][2] * z + inv[r][3]
+                         for r in range(3))
+
+        def close3(got, want, tol=1e-4):
+            return isinstance(got, list) and len(got) == 3 and all(
+                abs(g - e) <= tol for g, e in zip(got, want))
+
+        def build_side(endian, datatype, transform, dims, side_data_fn,
+                       slope, inter, sform_affine, qoffset, pixdim):
+            return build_nifti(
+                endian=endian, datatype=datatype, dims=dims, data_fn=side_data_fn,
+                transform=transform, slope=slope, inter=inter,
+                srow_x=sform_affine[0], srow_y=sform_affine[1],
+                srow_z=sform_affine[2],
+                quatern=QUATERN_90Z, qoffset=qoffset, pixdim=pixdim)
+
+        def baseline_file(endian, datatype, transform):
+            return build_side(endian, datatype, transform, DIMS, data_fn,
+                              SLOPE, INTER, SFORM_AFFINE, (10.0, 20.0, 30.0),
+                              (1.0, 2.0, 3.0, 4.0))
+
+        def followup_file(endian, datatype, transform):
+            return build_side(endian, datatype, transform, F_DIMS,
+                              lambda i, j, k: F_RAW, F_SLOPE, F_INTER,
+                              F_SFORM, (14.0, 20.0, 30.0), (1.0, 1.0, 2.0, 5.0))
+
+        # (tag, baseline cfg, followup cfg, world points inside both footprints)
+        pairs = [
+            ("LE/int16/sform x BE/float32/qform", ("<", "int16", "sform"),
+             (">", "float32", "qform"),
+             [(12.0, 22.0, 35.0), (11.0, 24.0, 40.0), (13.5, 20.5, 44.0)]),
+            ("BE/float32/qform x LE/int16/sform", (">", "float32", "qform"),
+             ("<", "int16", "sform"),
+             [(9.5, 22.0, 35.0), (9.7, 25.0, 38.0)]),
+            ("BE/int16/sform x LE/float32/sform", (">", "int16", "sform"),
+             ("<", "float32", "sform"),
+             [(12.0, 22.0, 35.0), (13.0, 24.0, 38.0)]),
+            ("LE/int16/qform x BE/float32/qform", ("<", "int16", "qform"),
+             (">", "float32", "qform"),
+             [(8.0, 22.0, 35.0), (9.5, 24.0, 40.0)]),
+        ]
+        for tag, bcfg, fcfg, worlds in pairs:
+            b_aff = SFORM_AFFINE if bcfg[2] == "sform" else QFORM_AFFINE
+            f_aff = F_SFORM if fcfg[2] == "sform" else F_QFORM
+            raw_b = baseline_file(*bcfg)
+            raw_f = followup_file(*fcfg)
+            ids = list(range(len(worlds), 0, -1))  # ids reversed vs point order
+            points = [{"id": pid, "point": list(w)} for pid, w in zip(ids, worlds)]
+            status, payload = post_compare(base_url, raw_b, raw_f, points)
+            if not check(f"compare[{tag}]: HTTP 200", status == 200,
+                         f"got {status}: {payload}"):
+                continue
+            check(f"compare[{tag}]: top-level transforms",
+                  isinstance(payload, dict)
+                  and payload.get("baseline", {}).get("transform") == bcfg[2]
+                  and payload.get("followup", {}).get("transform") == fcfg[2],
+                  repr(payload))
+            results = payload.get("results") if isinstance(payload, dict) else None
+            if not check(f"compare[{tag}]: request order preserved",
+                         isinstance(results, list)
+                         and [r.get("id") for r in results] == ids,
+                         repr(results)):
+                continue
+            for res, world in zip(results, worlds):
+                pid = res.get("id")
+                eb = exp_voxel(b_aff, world)
+                ef = exp_voxel(f_aff, world)
+                # baseline data is linear, so trilinear interpolation is exact
+                b_int = (eb[0] + 10.0 * eb[1] + 100.0 * eb[2]) * SLOPE + INTER
+                bs = res.get("baseline", {})
+                fs = res.get("followup", {})
+                ok = res.get("status") == "ok"
+                ok = ok and close3(bs.get("voxel"), eb) \
+                    and abs((bs.get("intensity") or 0.0) - b_int) <= 1e-3 \
+                    and bs.get("transform") == bcfg[2]
+                ok = ok and close3(fs.get("voxel"), ef) \
+                    and abs((fs.get("intensity") or 0.0) - F_INTENSITY) <= 1e-3 \
+                    and fs.get("transform") == fcfg[2]
+                ok = ok and abs((res.get("delta") or 0.0)
+                                - (F_INTENSITY - b_int)) <= 1e-3
+                check(f"compare[{tag}]: id {pid} both sides + delta", ok, repr(res))
+
+        # -- compare: per-side point errors on mismatched grids ----------------
+        nan_base = build_nifti(
+            endian="<", datatype="float32", dims=DIMS,
+            data_fn=lambda i, j, k: float("nan") if (i, j, k) == (1, 1, 1)
+            else data_fn(i, j, k),
+            transform="sform", slope=SLOPE, inter=INTER,
+            srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1], srow_z=SFORM_AFFINE[2])
+        nan_foll = build_nifti(
+            endian=">", datatype="float32", dims=F_DIMS,
+            data_fn=lambda i, j, k: float("nan") if (i, j, k) == (4, 2, 3)
+            else F_RAW,
+            transform="qform", slope=F_SLOPE, inter=F_INTER,
+            quatern=QUATERN_90Z, qoffset=(14.0, 20.0, 30.0),
+            pixdim=(1.0, 1.0, 2.0, 5.0))
+        side_points = [
+            (1, (12.0, 24.0, 40.0), "ok", None, None),
+            (2, (15.0, 22.0, 35.0), "error", "followup", "out_of_bounds"),
+            (3, (8.0, 22.0, 35.0), "error", "baseline", "out_of_bounds"),
+            (4, (20.0, 22.0, 35.0), "error", "baseline", "out_of_bounds"),
+            (5, (12.0, 23.0, 34.0), "error", "baseline", "non_finite_data"),
+            (6, (10.0, 24.0, 45.0), "error", "followup", "non_finite_data"),
+        ]
+        points = [{"id": pid, "point": list(w)} for pid, w, _, _, _ in side_points]
+        status, payload = post_compare(base_url, nan_base, nan_foll, points)
+        results = {r.get("id"): r for r in payload.get("results", [])} \
+            if status == 200 and isinstance(payload, dict) else {}
+        check("compare sides: HTTP 200", status == 200, f"got {status}: {payload}")
+        for pid, world, want_status, want_side, want_code in side_points:
+            r = results.get(pid, {})
+            if want_status == "ok":
+                check(f"compare sides: id {pid} ok",
+                      r.get("status") == "ok"
+                      and abs((r.get("delta") or 0.0)
+                              - (r.get("followup", {}).get("intensity", 0.0)
+                                 - r.get("baseline", {}).get("intensity", 0.0)))
+                      <= 1e-9,
+                      repr(r))
+            else:
+                err = r.get("error", {})
+                check(f"compare sides: id {pid} {want_side}/{want_code}",
+                      r.get("status") == "error"
+                      and err.get("code") == want_code
+                      and err.get("side") == want_side,
+                      repr(r))
+
+        # -- compare: file-level errors locate the failing upload --------------
+        good_base = baseline_file("<", "int16", "sform")
+        good_foll = followup_file("<", "int16", "sform")
+        one = [{"id": 1, "point": [12.0, 22.0, 35.0]}]
+        bad_base = build_nifti(endian="<", datatype="int16", dims=DIMS,
+                               data_fn=data_fn, transform="sform",
+                               srow_x=SFORM_AFFINE[0], srow_y=SFORM_AFFINE[1],
+                               srow_z=SFORM_AFFINE[2], extra=b"\x00")
+        bad_foll = build_nifti(endian=">", datatype="int16", dims=F_DIMS,
+                               data_fn=lambda i, j, k: 7, transform="sform",
+                               srow_x=F_SFORM[0], srow_y=F_SFORM[1],
+                               srow_z=F_SFORM[2], magic=b"ni1\x00")
+        file_cases = [
+            ("baseline trailing bytes", bad_base, good_foll, one, {},
+             "trailing_bytes", "file", "baseline"),
+            ("followup bad magic", good_base, bad_foll, one, {},
+             "unsupported_magic", "magic", "followup"),
+            ("missing followup", good_base, good_foll, one,
+             {"followup_field": "file"}, "missing_file", "followup", "followup"),
+            ("duplicate baseline", good_base, good_foll, one,
+             {"followup_field": "baseline"}, "multiple_files", "baseline", "baseline"),
+            ("invalid points", good_base, good_foll, [], {},
+             "invalid_points", "points", None),
+        ]
+        for name, rb, rf, pts, kw, code, field, side in file_cases:
+            status, payload = post_compare(base_url, rb, rf, pts, **kw)
+            err = payload.get("error", {}) if isinstance(payload, dict) else {}
+            ok = status == 400 and err.get("code") == code \
+                and err.get("field") == field
+            if side is not None:
+                ok = ok and err.get("side") == side
+            check(f"compare negative[{name}]: 400/{code}", ok,
+                  f"got {status}: {payload}")
 
     ok = not failures
     print(f"stage smoke: {'PASS' if ok else 'FAIL'} "

@@ -1,7 +1,8 @@
 # nifti-sampler
 
 神经影像质控平台的体数据抽查服务：按扫描仪 RAS 世界坐标对三维 NIfTI-1
-体数据做三线性插值采样。严格校验方向矩阵（sform/qform）、字节序与强度
+体数据做三线性插值采样，并支持基线/随访双文件按同一世界坐标对照
+（`/api/nifti/compare`）。严格校验方向矩阵（sform/qform）、字节序与强度
 缩放，避免核对到错误体素。纯 Python 标准库实现，无第三方依赖。
 
 ## API
@@ -43,6 +44,61 @@ curl -F "file=@vol.nii" \
 `scl_slope`/`scl_inter` 缩放）、所用变换来源（`transform`，
 `sform` 或 `qform`）。越界点、非有限数据以**逐点错误**返回，不影响其余点。
 
+### `POST /api/nifti/compare`
+
+基线/随访对照采样：同一 RAS 世界坐标分别映射到两份体数据各自的体素空间，
+返回两侧插值强度与差值（followup − baseline）。两份文件独立执行与
+`/api/nifti/sample` 相同的 NIfTI 校验、仿射选择（sform 优先于 qform）与
+三线性插值规则；**尺寸、方向、字节序、数据类型均无需相同**。
+
+`multipart/form-data`，包含：
+
+| 部分 | 说明 |
+| --- | --- |
+| `baseline` 文件部分（须带 `filename`） | 基线 NIfTI-1 `.nii` 文件，≤ 16 MiB |
+| `followup` 文件部分（须带 `filename`） | 随访 NIfTI-1 `.nii` 文件，≤ 16 MiB |
+| `points` 字段 | 与 `/api/nifti/sample` 相同：1–256 个 `[{"id": 0, "point": [x, y, z]}, ...]` |
+
+```bash
+curl -F "baseline=@baseline.nii" \
+     -F "followup=@followup.nii" \
+     -F 'points=[{"id": 1, "point": [12.0, 26.0, 42.0]}]' \
+     http://localhost:8000/api/nifti/compare
+```
+
+**成功响应（200）**，结果顺序与请求一致：
+
+```json
+{
+  "baseline": {"transform": "sform"},
+  "followup": {"transform": "qform"},
+  "results": [
+    {"id": 1, "status": "ok",
+     "baseline": {"voxel": [1.0, 2.0, 3.0], "intensity": 647.0,
+                  "transform": "sform"},
+     "followup": {"voxel": [2.0, 1.0, 0.5], "intensity": 635.0,
+                  "transform": "qform"},
+     "delta": -12.0},
+    {"id": 2, "status": "error",
+     "error": {"code": "out_of_bounds", "message": "...",
+               "side": "followup", "voxel": [7.0, 7.0, 5.0]}}
+  ]
+}
+```
+
+每个成功点给出两侧各自的连续体素坐标、缩放后强度、变换来源，以及
+`delta = followup − baseline`。任一侧越界或邻域数据非有限时，该点以
+`status: "error"` 返回：`error.side` 标明失败侧（`baseline` 或
+`followup`；两侧皆失败时报先求值的 `baseline`），`error.voxel` 为失败侧
+的连续体素坐标。单点失败不影响其余点，复核人员可据此区分真实强度变化与
+单侧不可采样。
+
+文件/请求级错误沿用下表的 `code`/`field`，并额外携带
+`"side": "baseline" | "followup"` 定位到具体上传（`field` 仍为具体头字段）。
+表单级错误（`missing_file`/`multiple_files`/单文件 `file_too_large`）的
+`field` 直接为 `baseline` 或 `followup`。请求体上限为两个 16 MiB 文件加
+表单开销；`points` 校验规则与 `/api/nifti/sample` 完全一致。
+
 ### 错误
 
 文件/请求级错误返回 4xx，JSON 形如
@@ -71,6 +127,7 @@ curl -F "file=@vol.nii" \
 
 逐点错误（200 响应内）：`out_of_bounds`（逆变换后落在体素中心闭域
 `[0, n-1]` 之外）、`non_finite_data`（插值邻域内缩放后数据非有限）。
+compare 端点的逐点错误另带 `side`（`baseline`/`followup`）标明失败侧。
 
 ### `GET /healthz`
 
@@ -117,7 +174,7 @@ docker compose up --build --exit-code-from verify verify
 | --- | --- | --- |
 | bit0 | 1 | 代码测试（`tests/` 单元 + 集成测试） |
 | bit1 | 2 | 镜像构建校验（构建清单、运行时版本、模块导入、采样自检） |
-| bit2 | 4 | API 冒烟（大/小端 × sform/qform × int16/float32 样本矩阵 + 结构错误与逐点错误用例） |
+| bit2 | 4 | API 冒烟（sample 大/小端 × sform/qform × int16/float32 矩阵；compare 不同字节序/数据类型/仿射/网格组合；结构错误与逐点/逐侧错误用例） |
 
 退出码 0 表示全部通过。本地复现（stage 2 需要镜像构建清单
 `image-manifest.json`，仅在 Dockerfile 构建时生成）：
